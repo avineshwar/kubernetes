@@ -31,12 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	core "k8s.io/client-go/testing"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/testing/core"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
+	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
 	"k8s.io/kubernetes/pkg/kubelet/server/remotecommand"
 )
 
@@ -174,16 +174,19 @@ func TestGenerateRunContainerOptions_DNSConfigurationParams(t *testing.T) {
 
 	clusterNS := "203.0.113.1"
 	kubelet.clusterDomain = "kubernetes.io"
-	kubelet.clusterDNS = net.ParseIP(clusterNS)
+	kubelet.clusterDNS = []net.IP{net.ParseIP(clusterNS)}
 
-	pods := newTestPods(2)
-	pods[0].Spec.DNSPolicy = v1.DNSClusterFirst
-	pods[1].Spec.DNSPolicy = v1.DNSDefault
+	pods := newTestPods(4)
+	pods[0].Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
+	pods[1].Spec.DNSPolicy = v1.DNSClusterFirst
+	pods[2].Spec.DNSPolicy = v1.DNSClusterFirst
+	pods[2].Spec.HostNetwork = false
+	pods[3].Spec.DNSPolicy = v1.DNSDefault
 
-	options := make([]*kubecontainer.RunContainerOptions, 2)
+	options := make([]*kubecontainer.RunContainerOptions, 4)
 	for i, pod := range pods {
 		var err error
-		options[i], err = kubelet.GenerateRunContainerOptions(pod, &v1.Container{}, "")
+		options[i], _, err = kubelet.GenerateRunContainerOptions(pod, &v1.Container{}, "")
 		if err != nil {
 			t.Fatalf("failed to generate container options: %v", err)
 		}
@@ -200,11 +203,23 @@ func TestGenerateRunContainerOptions_DNSConfigurationParams(t *testing.T) {
 	if len(options[1].DNSSearch) != 1 || options[1].DNSSearch[0] != "." {
 		t.Errorf("expected search \".\", got %+v", options[1].DNSSearch)
 	}
+	if len(options[2].DNS) != 1 || options[2].DNS[0] != clusterNS {
+		t.Errorf("expected nameserver %s, got %+v", clusterNS, options[2].DNS)
+	}
+	if len(options[2].DNSSearch) == 0 || options[2].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
+		t.Errorf("expected search %s, got %+v", ".svc."+kubelet.clusterDomain, options[2].DNSSearch)
+	}
+	if len(options[3].DNS) != 1 || options[3].DNS[0] != "127.0.0.1" {
+		t.Errorf("expected nameserver 127.0.0.1, got %+v", options[3].DNS)
+	}
+	if len(options[3].DNSSearch) != 1 || options[3].DNSSearch[0] != "." {
+		t.Errorf("expected search \".\", got %+v", options[3].DNSSearch)
+	}
 
 	kubelet.resolverConfig = "/etc/resolv.conf"
 	for i, pod := range pods {
 		var err error
-		options[i], err = kubelet.GenerateRunContainerOptions(pod, &v1.Container{}, "")
+		options[i], _, err = kubelet.GenerateRunContainerOptions(pod, &v1.Container{}, "")
 		if err != nil {
 			t.Fatalf("failed to generate container options: %v", err)
 		}
@@ -222,6 +237,16 @@ func TestGenerateRunContainerOptions_DNSConfigurationParams(t *testing.T) {
 	if len(options[0].DNSSearch) != expLength {
 		t.Errorf("expected prepend of cluster domain, got %+v", options[0].DNSSearch)
 	} else if options[0].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
+		t.Errorf("expected domain %s, got %s", ".svc."+kubelet.clusterDomain, options[0].DNSSearch)
+	}
+	if len(options[2].DNS) != 1 {
+		t.Errorf("expected cluster nameserver only, got %+v", options[2].DNS)
+	} else if options[2].DNS[0] != clusterNS {
+		t.Errorf("expected nameserver %s, got %v", clusterNS, options[2].DNS[0])
+	}
+	if len(options[2].DNSSearch) != expLength {
+		t.Errorf("expected prepend of cluster domain, got %+v", options[2].DNSSearch)
+	} else if options[2].DNSSearch[0] != ".svc."+kubelet.clusterDomain {
 		t.Errorf("expected domain %s, got %s", ".svc."+kubelet.clusterDomain, options[0].DNSSearch)
 	}
 }
@@ -1607,7 +1632,7 @@ func TestPortForward(t *testing.T) {
 		podName                = "podFoo"
 		podNamespace           = "nsFoo"
 		podUID       types.UID = "12345678"
-		port         uint16    = 5000
+		port         int32     = 5000
 	)
 	var (
 		stream = &fakeReadWriteCloser{}
@@ -1646,7 +1671,7 @@ func TestPortForward(t *testing.T) {
 		podFullName := kubecontainer.GetPodFullName(podWithUidNameNs(podUID, tc.podName, podNamespace))
 		{ // No streaming case
 			description := "no streaming - " + tc.description
-			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID)
+			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
 			assert.Error(t, err, description)
 			assert.Nil(t, redirect, description)
 
@@ -1658,7 +1683,7 @@ func TestPortForward(t *testing.T) {
 			fakeRuntime := &containertest.FakeDirectStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
 			kubelet.containerRuntime = fakeRuntime
 
-			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID)
+			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
 			assert.NoError(t, err, description)
 			assert.Nil(t, redirect, description)
 
@@ -1677,7 +1702,7 @@ func TestPortForward(t *testing.T) {
 			fakeRuntime := &containertest.FakeIndirectStreamingRuntime{FakeRuntime: testKubelet.fakeRuntime}
 			kubelet.containerRuntime = fakeRuntime
 
-			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID)
+			redirect, err := kubelet.GetPortForward(tc.podName, podNamespace, podUID, portforward.V4Options{})
 			if tc.expectError {
 				assert.Error(t, err, description)
 			} else {
@@ -1708,39 +1733,6 @@ func TestGetHostPortConflicts(t *testing.T) {
 	// The new pod should cause conflict and be reported.
 	pods = append(pods, expected)
 	assert.True(t, hasHostPortConflicts(pods), "Should have port conflicts")
-}
-
-func TestMakeDevices(t *testing.T) {
-	testCases := []struct {
-		container *v1.Container
-		devices   []kubecontainer.DeviceInfo
-		test      string
-	}{
-		{
-			test:      "no device",
-			container: &v1.Container{},
-			devices:   nil,
-		},
-		{
-			test: "gpu",
-			container: &v1.Container{
-				Resources: v1.ResourceRequirements{
-					Limits: map[v1.ResourceName]resource.Quantity{
-						v1.ResourceNvidiaGPU: resource.MustParse("1000"),
-					},
-				},
-			},
-			devices: []kubecontainer.DeviceInfo{
-				{PathOnHost: "/dev/nvidia0", PathInContainer: "/dev/nvidia0", Permissions: "mrw"},
-				{PathOnHost: "/dev/nvidiactl", PathInContainer: "/dev/nvidiactl", Permissions: "mrw"},
-				{PathOnHost: "/dev/nvidia-uvm", PathInContainer: "/dev/nvidia-uvm", Permissions: "mrw"},
-			},
-		},
-	}
-
-	for _, test := range testCases {
-		assert.Equal(t, test.devices, makeDevices(test.container), "[test %q]", test.test)
-	}
 }
 
 func TestHasHostMountPVC(t *testing.T) {

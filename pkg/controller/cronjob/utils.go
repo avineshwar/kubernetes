@@ -215,7 +215,7 @@ func getTimeHash(scheduledTime time.Time) int64 {
 
 // makeCreatedByRefJson makes a json string with an object reference for use in "created-by" annotation value
 func makeCreatedByRefJson(object runtime.Object) (string, error) {
-	createdByRef, err := v1.GetReference(object)
+	createdByRef, err := v1.GetReference(api.Scheme, object)
 	if err != nil {
 		return "", fmt.Errorf("unable to get controller reference: %v", err)
 	}
@@ -234,11 +234,34 @@ func makeCreatedByRefJson(object runtime.Object) (string, error) {
 	return string(createdByRefJson), nil
 }
 
-func IsJobFinished(j *batch.Job) bool {
+func getFinishedStatus(j *batch.Job) (bool, batch.JobConditionType) {
 	for _, c := range j.Status.Conditions {
 		if (c.Type == batch.JobComplete || c.Type == batch.JobFailed) && c.Status == v1.ConditionTrue {
-			return true
+			return true, c.Type
 		}
 	}
-	return false
+	return false, ""
+}
+
+func IsJobFinished(j *batch.Job) bool {
+	isFinished, _ := getFinishedStatus(j)
+	return isFinished
+}
+
+// byJobStartTime sorts a list of jobs by start timestamp, using their names as a tie breaker.
+type byJobStartTime []batch.Job
+
+func (o byJobStartTime) Len() int      { return len(o) }
+func (o byJobStartTime) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+
+func (o byJobStartTime) Less(i, j int) bool {
+	if o[j].Status.StartTime == nil {
+		return o[i].Status.StartTime != nil
+	}
+
+	if (*o[i].Status.StartTime).Equal(*o[j].Status.StartTime) {
+		return o[i].Name < o[j].Name
+	}
+
+	return (*o[i].Status.StartTime).Before(*o[j].Status.StartTime)
 }

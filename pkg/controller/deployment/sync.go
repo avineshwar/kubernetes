@@ -180,7 +180,9 @@ func (dc *DeploymentController) addHashKeyToRSAndPods(rs *extensions.ReplicaSet)
 	}
 	// Make sure rs pod template is updated so that it won't create pods without the new label (orphaned pods).
 	if updatedRS.Generation > updatedRS.Status.ObservedGeneration {
-		if err = deploymentutil.WaitForReplicaSetUpdated(dc.client, updatedRS.Generation, updatedRS.Namespace, updatedRS.Name); err != nil {
+		// TODO: Revisit if we really need to wait here as opposed to returning and
+		// potentially unblocking this worker (can wait up to 1min before timing out).
+		if err = deploymentutil.WaitForReplicaSetUpdated(dc.rsLister, updatedRS.Generation, updatedRS.Namespace, updatedRS.Name); err != nil {
 			return nil, fmt.Errorf("error waiting for replica set %s/%s to be observed by controller: %v", updatedRS.Namespace, updatedRS.Name, err)
 		}
 		glog.V(4).Infof("Observed the update of replica set %s/%s's pod template with hash %s.", rs.Namespace, rs.Name, hash)
@@ -213,7 +215,9 @@ func (dc *DeploymentController) addHashKeyToRSAndPods(rs *extensions.ReplicaSet)
 	// WaitForReplicaSetUpdated, the replicaset controller should have dropped
 	// FullyLabeledReplicas to 0 already, we only need to wait it to increase
 	// back to the number of replicas in the spec.
-	if err := deploymentutil.WaitForPodsHashPopulated(dc.client, updatedRS.Generation, updatedRS.Namespace, updatedRS.Name); err != nil {
+	// TODO: Revisit if we really need to wait here as opposed to returning and
+	// potentially unblocking this worker (can wait up to 1min before timing out).
+	if err := deploymentutil.WaitForPodsHashPopulated(dc.rsLister, updatedRS.Generation, updatedRS.Namespace, updatedRS.Name); err != nil {
 		return nil, fmt.Errorf("Replica set %s/%s: error waiting for replicaset controller to observe pods being labeled with template hash: %v", updatedRS.Namespace, updatedRS.Name, err)
 	}
 
@@ -541,21 +545,30 @@ func (dc *DeploymentController) cleanupDeployment(oldRSs []*extensions.ReplicaSe
 	if deployment.Spec.RevisionHistoryLimit == nil {
 		return nil
 	}
-	diff := int32(len(oldRSs)) - *deployment.Spec.RevisionHistoryLimit
+
+	// Avoid deleting replica set with deletion timestamp set
+	aliveFilter := func(rs *extensions.ReplicaSet) bool {
+		return rs != nil && rs.ObjectMeta.DeletionTimestamp == nil
+	}
+	cleanableRSes := controller.FilterReplicaSets(oldRSs, aliveFilter)
+
+	diff := int32(len(cleanableRSes)) - *deployment.Spec.RevisionHistoryLimit
 	if diff <= 0 {
 		return nil
 	}
 
-	sort.Sort(controller.ReplicaSetsByCreationTimestamp(oldRSs))
+	sort.Sort(controller.ReplicaSetsByCreationTimestamp(cleanableRSes))
+	glog.V(4).Infof("Looking to cleanup old replica sets for deployment %q", deployment.Name)
 
 	var errList []error
 	// TODO: This should be parallelized.
 	for i := int32(0); i < diff; i++ {
-		rs := oldRSs[i]
+		rs := cleanableRSes[i]
 		// Avoid delete replica set with non-zero replica counts
-		if rs.Status.Replicas != 0 || *(rs.Spec.Replicas) != 0 || rs.Generation > rs.Status.ObservedGeneration {
+		if rs.Status.Replicas != 0 || *(rs.Spec.Replicas) != 0 || rs.Generation > rs.Status.ObservedGeneration || rs.DeletionTimestamp != nil {
 			continue
 		}
+		glog.V(4).Infof("Trying to cleanup replica set %q for deployment %q", rs.Name, deployment.Name)
 		if err := dc.client.Extensions().ReplicaSets(rs.Namespace).Delete(rs.Name, nil); err != nil && !errors.IsNotFound(err) {
 			glog.V(2).Infof("Failed deleting old replica set %v for deployment %v: %v", rs.Name, deployment.Name, err)
 			errList = append(errList, err)

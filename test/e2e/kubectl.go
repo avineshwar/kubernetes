@@ -43,6 +43,7 @@ import (
 	"github.com/ghodss/yaml"
 
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -50,13 +51,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/kubernetes/pkg/api/annotations"
-	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/api/v1"
 	rbacv1beta1 "k8s.io/kubernetes/pkg/apis/rbac/v1beta1"
 	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 	"k8s.io/kubernetes/pkg/controller"
-	genericregistry "k8s.io/kubernetes/pkg/genericapiserver/registry/generic/registry"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	uexec "k8s.io/kubernetes/pkg/util/exec"
 	utilversion "k8s.io/kubernetes/pkg/util/version"
@@ -583,7 +583,7 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 			framework.BindClusterRole(f.ClientSet.Rbac(), "view", f.Namespace.Name,
 				rbacv1beta1.Subject{Kind: rbacv1beta1.ServiceAccountKind, Namespace: f.Namespace.Name, Name: "default"})
 
-			err := framework.WaitForAuthorizationUpdate(f.ClientSet.Authorization(),
+			err := framework.WaitForAuthorizationUpdate(f.ClientSet.AuthorizationV1beta1(),
 				serviceaccount.MakeUsername(f.Namespace.Name, "default"),
 				f.Namespace.Name, "list", schema.GroupResource{Resource: "pods"}, true)
 			framework.ExpectNoError(err)
@@ -718,6 +718,7 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 					{"Node:"},
 					{"Labels:", "app=redis"},
 					{"role=master"},
+					{"Annotations:"},
 					{"Status:", "Running"},
 					{"IP:"},
 					{"Controllers:", "ReplicationController/redis-master"},
@@ -733,18 +734,15 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 			requiredStrings := [][]string{
 				{"Name:", "redis-master"},
 				{"Namespace:", ns},
-				{"Image(s):", redisImage},
 				{"Selector:", "app=redis,role=master"},
 				{"Labels:", "app=redis"},
 				{"role=master"},
+				{"Annotations:"},
 				{"Replicas:", "1 current", "1 desired"},
 				{"Pods Status:", "1 Running", "0 Waiting", "0 Succeeded", "0 Failed"},
-				// {"Events:"} would ordinarily go in the list
-				// here, but in some rare circumstances the
-				// events are delayed, and instead kubectl
-				// prints "No events." This string will match
-				// either way.
-				{"vents"}}
+				{"Pod Template:"},
+				{"Image:", redisImage},
+				{"Events:"}}
 			checkOutput(output, requiredStrings)
 
 			// Service
@@ -754,6 +752,7 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 				{"Namespace:", ns},
 				{"Labels:", "app=redis"},
 				{"role=master"},
+				{"Annotations:"},
 				{"Selector:", "app=redis", "role=master"},
 				{"Type:", "ClusterIP"},
 				{"IP:"},
@@ -771,6 +770,7 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 			requiredStrings = [][]string{
 				{"Name:", node.Name},
 				{"Labels:"},
+				{"Annotations:"},
 				{"CreationTimestamp:"},
 				{"Conditions:"},
 				{"Type", "Status", "LastHeartbeatTime", "LastTransitionTime", "Reason", "Message"},
@@ -790,6 +790,7 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 			requiredStrings = [][]string{
 				{"Name:", ns},
 				{"Labels:"},
+				{"Annotations:"},
 				{"Status:", "Active"}}
 			checkOutput(output, requiredStrings)
 
@@ -1395,7 +1396,9 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 		})
 	})
 
-	framework.KubeDescribe("Kubectl taint", func() {
+	// This test must run [Serial] because it modifies the node so it doesn't allow pods to execute on
+	// it, which will affect anything else running in parallel.
+	framework.KubeDescribe("Kubectl taint [Serial]", func() {
 		It("should update the taint on a node", func() {
 			testTaint := v1.Taint{
 				Key:    fmt.Sprintf("kubernetes.io/e2e-taint-key-001-%s", string(uuid.NewUUID())),
@@ -1464,6 +1467,24 @@ var _ = framework.KubeDescribe("Kubectl client", func() {
 				{"Name:", nodeName},
 				{"Taints:"},
 				{newTestTaint.ToString()},
+			}
+			checkOutput(output, requiredStrings)
+
+			noExecuteTaint := v1.Taint{
+				Key:    testTaint.Key,
+				Value:  "testing-taint-value-no-execute",
+				Effect: v1.TaintEffectNoExecute,
+			}
+			By("adding NoExecute taint " + noExecuteTaint.ToString() + " to the node")
+			runKubectlRetryOrDie("taint", "nodes", nodeName, noExecuteTaint.ToString())
+			defer framework.RemoveTaintOffNode(f.ClientSet, nodeName, noExecuteTaint)
+
+			By("verifying the node has the taint " + noExecuteTaint.ToString())
+			output = runKubectlRetryOrDie("describe", "node", nodeName)
+			requiredStrings = [][]string{
+				{"Name:", nodeName},
+				{"Taints:"},
+				{noExecuteTaint.ToString()},
 			}
 			checkOutput(output, requiredStrings)
 

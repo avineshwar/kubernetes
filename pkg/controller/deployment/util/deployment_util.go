@@ -25,11 +25,13 @@ import (
 
 	"github.com/golang/glog"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/errors"
+	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/integer"
 	"k8s.io/kubernetes/pkg/api"
@@ -38,9 +40,9 @@ import (
 	internalextensions "k8s.io/kubernetes/pkg/apis/extensions"
 	extensions "k8s.io/kubernetes/pkg/apis/extensions/v1beta1"
 	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	"k8s.io/kubernetes/pkg/client/legacylisters"
+	corelisters "k8s.io/kubernetes/pkg/client/listers/core/v1"
+	extensionslisters "k8s.io/kubernetes/pkg/client/listers/extensions/v1beta1"
 	"k8s.io/kubernetes/pkg/controller"
-	intstrutil "k8s.io/kubernetes/pkg/util/intstr"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
 )
 
@@ -386,8 +388,7 @@ func getIntFromAnnotation(rs *extensions.ReplicaSet, annotationKey string) (int3
 	}
 	intValue, err := strconv.Atoi(annotationValue)
 	if err != nil {
-		glog.Warningf("Cannot convert the value %q with annotation key %q for the replica set %q",
-			annotationValue, annotationKey, rs.Name)
+		glog.V(2).Infof("Cannot convert the value %q with annotation key %q for the replica set %q", annotationValue, annotationKey, rs.Name)
 		return int32(0), false
 	}
 	return int32(intValue), true
@@ -414,11 +415,22 @@ func SetReplicasAnnotations(rs *extensions.ReplicaSet, desiredReplicas, maxRepli
 
 // MaxUnavailable returns the maximum unavailable pods a rolling deployment can take.
 func MaxUnavailable(deployment extensions.Deployment) int32 {
-	if !IsRollingUpdate(&deployment) {
+	if !IsRollingUpdate(&deployment) || *(deployment.Spec.Replicas) == 0 {
 		return int32(0)
 	}
 	// Error caught by validation
 	_, maxUnavailable, _ := ResolveFenceposts(deployment.Spec.Strategy.RollingUpdate.MaxSurge, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable, *(deployment.Spec.Replicas))
+	return maxUnavailable
+}
+
+// MaxUnavailableInternal returns the maximum unavailable pods a rolling deployment can take.
+// TODO: remove the duplicate
+func MaxUnavailableInternal(deployment internalextensions.Deployment) int32 {
+	if !(deployment.Spec.Strategy.Type == internalextensions.RollingUpdateDeploymentStrategyType) || deployment.Spec.Replicas == 0 {
+		return int32(0)
+	}
+	// Error caught by validation
+	_, maxUnavailable, _ := ResolveFenceposts(&deployment.Spec.Strategy.RollingUpdate.MaxSurge, &deployment.Spec.Strategy.RollingUpdate.MaxUnavailable, deployment.Spec.Replicas)
 	return maxUnavailable
 }
 
@@ -605,15 +617,19 @@ func EqualIgnoreHash(template1, template2 v1.PodTemplateSpec) bool {
 	}
 	// Then, compare the templates without comparing their labels
 	template1.Labels, template2.Labels = nil, nil
-	return api.Semantic.DeepEqual(template1, template2)
+	return apiequality.Semantic.DeepEqual(template1, template2)
 }
 
 // FindNewReplicaSet returns the new RS this given deployment targets (the one with the same pod template).
 func FindNewReplicaSet(deployment *extensions.Deployment, rsList []*extensions.ReplicaSet) (*extensions.ReplicaSet, error) {
 	newRSTemplate := GetNewReplicaSetTemplate(deployment)
+	sort.Sort(controller.ReplicaSetsByCreationTimestamp(rsList))
 	for i := range rsList {
 		if EqualIgnoreHash(rsList[i].Spec.Template, newRSTemplate) {
-			// This is the new ReplicaSet.
+			// In rare cases, such as after cluster upgrades, Deployment may end up with
+			// having more than one new ReplicaSets that have the same template as its template,
+			// see https://github.com/kubernetes/kubernetes/issues/40415
+			// We deterministically choose the oldest new ReplicaSet.
 			return rsList[i], nil
 		}
 	}
@@ -628,7 +644,12 @@ func FindOldReplicaSets(deployment *extensions.Deployment, rsList []*extensions.
 	// All pods and replica sets are labeled with pod-template-hash to prevent overlapping
 	oldRSs := map[string]*extensions.ReplicaSet{}
 	allOldRSs := map[string]*extensions.ReplicaSet{}
-	newRSTemplate := GetNewReplicaSetTemplate(deployment)
+	requiredRSs := []*extensions.ReplicaSet{}
+	allRSs := []*extensions.ReplicaSet{}
+	newRS, err := FindNewReplicaSet(deployment, rsList)
+	if err != nil {
+		return requiredRSs, allRSs, err
+	}
 	for _, pod := range podList.Items {
 		podLabelsSelector := labels.Set(pod.ObjectMeta.Labels)
 		for _, rs := range rsList {
@@ -636,8 +657,8 @@ func FindOldReplicaSets(deployment *extensions.Deployment, rsList []*extensions.
 			if err != nil {
 				return nil, nil, fmt.Errorf("invalid label selector: %v", err)
 			}
-			// Filter out replica set that has the same pod template spec as the deployment - that is the new replica set.
-			if EqualIgnoreHash(rs.Spec.Template, newRSTemplate) {
+			// Filter out new replica set
+			if newRS != nil && rs.UID == newRS.UID {
 				continue
 			}
 			allOldRSs[rs.ObjectMeta.Name] = rs
@@ -646,12 +667,10 @@ func FindOldReplicaSets(deployment *extensions.Deployment, rsList []*extensions.
 			}
 		}
 	}
-	requiredRSs := []*extensions.ReplicaSet{}
 	for key := range oldRSs {
 		value := oldRSs[key]
 		requiredRSs = append(requiredRSs, value)
 	}
-	allRSs := []*extensions.ReplicaSet{}
 	for key := range allOldRSs {
 		value := allOldRSs[key]
 		allRSs = append(allRSs, value)
@@ -660,9 +679,9 @@ func FindOldReplicaSets(deployment *extensions.Deployment, rsList []*extensions.
 }
 
 // WaitForReplicaSetUpdated polls the replica set until it is updated.
-func WaitForReplicaSetUpdated(c clientset.Interface, desiredGeneration int64, namespace, name string) error {
-	return wait.Poll(10*time.Millisecond, 1*time.Minute, func() (bool, error) {
-		rs, err := c.Extensions().ReplicaSets(namespace).Get(name, metav1.GetOptions{})
+func WaitForReplicaSetUpdated(c extensionslisters.ReplicaSetLister, desiredGeneration int64, namespace, name string) error {
+	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+		rs, err := c.ReplicaSets(namespace).Get(name)
 		if err != nil {
 			return false, err
 		}
@@ -671,9 +690,9 @@ func WaitForReplicaSetUpdated(c clientset.Interface, desiredGeneration int64, na
 }
 
 // WaitForPodsHashPopulated polls the replica set until updated and fully labeled.
-func WaitForPodsHashPopulated(c clientset.Interface, desiredGeneration int64, namespace, name string) error {
-	return wait.Poll(1*time.Second, 1*time.Minute, func() (bool, error) {
-		rs, err := c.Extensions().ReplicaSets(namespace).Get(name, metav1.GetOptions{})
+func WaitForPodsHashPopulated(c extensionslisters.ReplicaSetLister, desiredGeneration int64, namespace, name string) error {
+	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+		rs, err := c.ReplicaSets(namespace).Get(name)
 		if err != nil {
 			return false, err
 		}
@@ -684,7 +703,7 @@ func WaitForPodsHashPopulated(c clientset.Interface, desiredGeneration int64, na
 
 // LabelPodsWithHash labels all pods in the given podList with the new hash label.
 // The returned bool value can be used to tell if all pods are actually labeled.
-func LabelPodsWithHash(podList *v1.PodList, c clientset.Interface, podLister *listers.StoreToPodLister, namespace, name, hash string) error {
+func LabelPodsWithHash(podList *v1.PodList, c clientset.Interface, podLister corelisters.PodLister, namespace, name, hash string) error {
 	for _, pod := range podList.Items {
 		// Only label the pod that doesn't already have the new hash
 		if pod.Labels[extensions.DefaultDeploymentUniqueLabelKey] != hash {
@@ -785,40 +804,16 @@ func GetAvailableReplicaCountForReplicaSets(replicaSets []*extensions.ReplicaSet
 	return totalAvailableReplicas
 }
 
-// IsPodAvailable return true if the pod is available.
-// TODO: Remove this once we start using replica set status for calculating available pods
-// for a deployment.
-func IsPodAvailable(pod *v1.Pod, minReadySeconds int32, now time.Time) bool {
-	if !controller.IsPodActive(pod) {
-		return false
-	}
-	// Check if we've passed minReadySeconds since LastTransitionTime
-	// If so, this pod is ready
-	for _, c := range pod.Status.Conditions {
-		// we only care about pod ready conditions
-		if c.Type == v1.PodReady && c.Status == v1.ConditionTrue {
-			glog.V(4).Infof("Comparing pod %s/%s ready condition last transition time %s + minReadySeconds %d with now %s.", pod.Namespace, pod.Name, c.LastTransitionTime.String(), minReadySeconds, now.String())
-			// 2 cases that this ready condition is valid (passed minReadySeconds, i.e. the pod is available):
-			// 1. minReadySeconds == 0, or
-			// 2. LastTransitionTime (is set) + minReadySeconds (>0) < current time
-			minReadySecondsDuration := time.Duration(minReadySeconds) * time.Second
-			if minReadySeconds == 0 || !c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReadySecondsDuration).Before(now) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // IsRollingUpdate returns true if the strategy type is a rolling update.
 func IsRollingUpdate(deployment *extensions.Deployment) bool {
 	return deployment.Spec.Strategy.Type == extensions.RollingUpdateDeploymentStrategyType
 }
 
 // DeploymentComplete considers a deployment to be complete once its desired replicas equals its
-// updatedReplicas and it doesn't violate minimum availability.
+// updatedReplicas, no old pods are running, and it doesn't violate minimum availability.
 func DeploymentComplete(deployment *extensions.Deployment, newStatus *extensions.DeploymentStatus) bool {
 	return newStatus.UpdatedReplicas == *(deployment.Spec.Replicas) &&
+		newStatus.Replicas == *(deployment.Spec.Replicas) &&
 		newStatus.AvailableReplicas >= *(deployment.Spec.Replicas)-MaxUnavailable(*deployment) &&
 		newStatus.ObservedGeneration >= deployment.Generation
 }
@@ -865,8 +860,12 @@ func DeploymentTimedOut(deployment *extensions.Deployment, newStatus *extensions
 	// progress or tried to create a replica set, or resumed a paused deployment and
 	// compare against progressDeadlineSeconds.
 	from := condition.LastUpdateTime
+	now := nowFn()
 	delta := time.Duration(*deployment.Spec.ProgressDeadlineSeconds) * time.Second
-	return from.Add(delta).Before(nowFn())
+	timedOut := from.Add(delta).Before(now)
+
+	glog.V(4).Infof("Deployment %q timed out (%t) [last progress check: %v - now: %v]", deployment.Name, timedOut, from, now)
+	return timedOut
 }
 
 // NewRSNewReplicas calculates the number of replicas a deployment's new RS should have.

@@ -160,7 +160,7 @@ func (plugin *cniNetworkPlugin) Init(host network.Host, hairpinMode componentcon
 func (plugin *cniNetworkPlugin) syncNetworkConfig() {
 	network, err := getDefaultCNINetwork(plugin.pluginDir, plugin.binDir, plugin.vendorCNIDirPrefix)
 	if err != nil {
-		glog.Errorf("error updating cni config: %s", err)
+		glog.Warningf("Unable to update cni config: %s", err)
 		return
 	}
 	plugin.setDefaultNetwork(network)
@@ -180,7 +180,7 @@ func (plugin *cniNetworkPlugin) setDefaultNetwork(n *cniNetwork) {
 
 func (plugin *cniNetworkPlugin) checkInitialized() error {
 	if plugin.getDefaultNetwork() == nil {
-		return errors.New("cni config unintialized")
+		return errors.New("cni config uninitialized")
 	}
 	return nil
 }
@@ -189,7 +189,7 @@ func (plugin *cniNetworkPlugin) Name() string {
 	return CNIPluginName
 }
 
-func (plugin *cniNetworkPlugin) SetUpPod(namespace string, name string, id kubecontainer.ContainerID) error {
+func (plugin *cniNetworkPlugin) SetUpPod(namespace string, name string, id kubecontainer.ContainerID, annotations map[string]string) error {
 	if err := plugin.checkInitialized(); err != nil {
 		return err
 	}

@@ -63,6 +63,30 @@ parameters:
 
 * `diskformat`: `thin`, `zeroedthick` and `eagerzeroedthick`. See vSphere docs for details. Default: `"thin"`.
 
+#### Portworx Volume
+
+```yaml
+kind: StorageClass
+apiVersion: storage.k8s.io/v1beta1
+metadata:
+  name: portworx-io-priority-high
+provisioner: kubernetes.io/portworx-volume
+parameters:
+  repl: "1"
+  snap_interval:   "70"
+  io_priority:  "high"
+
+```
+
+*  `fs`: filesystem to be laid out: [none/xfs/ext4] (default: `ext4`)
+*  `block_size`: block size in Kbytes (default: `32`)
+*  `repl`: replication factor [1..3] (default: `1`)
+*  `io_priority`: IO Priority: [high/medium/low] (default: `low`)
+*  `snap_interval`: snapshot interval in minutes, 0 disables snaps (default: `0`)
+*  `aggregation_level`: specifies the number of chunks the volume would be distributed into, 0 indicates a non-aggregated volume (default: `0`)
+*  `ephemeral`: ephemeral storage [true/false] (default `false`)
+
+For a complete example refer ([Portworx Volume docs](../../volumes/portworx/README.md))
 
 #### GLUSTERFS
 
@@ -258,7 +282,7 @@ parameters:
 
 * `skuName`: Azure storage account Sku tier. Default is empty.
 * `location`: Azure storage account location. Default is empty.
-* `storageAccount`: Azure storage account name. If storage account is not provided, all storage accounts associated with the resource group are searched to find one that matches `skuName` and `location`. If storage account is provided, `skuName` and `location` are ignored.
+* `storageAccount`: Azure storage account name. If storage account is not provided, all storage accounts associated with the resource group are searched to find one that matches `skuName` and `location`. If storage account is provided, it must reside in the same resource group as the cluster, and `skuName` and `location` are ignored.
 
 ### User provisioning requests
 

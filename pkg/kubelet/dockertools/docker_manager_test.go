@@ -37,27 +37,27 @@ import (
 	"github.com/golang/mock/gomock"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kubetypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/clock"
 	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/api/v1"
 	"k8s.io/kubernetes/pkg/apis/componentconfig"
-	"k8s.io/kubernetes/pkg/client/record"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/kubelet/images"
 	"k8s.io/kubernetes/pkg/kubelet/network"
-	"k8s.io/kubernetes/pkg/kubelet/network/mock_network"
 	nettest "k8s.io/kubernetes/pkg/kubelet/network/testing"
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/types"
 	uexec "k8s.io/kubernetes/pkg/util/exec"
-	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
 var testTempDir string
@@ -83,44 +83,6 @@ type fakeHTTP struct {
 func (f *fakeHTTP) Get(url string) (*http.Response, error) {
 	f.url = url
 	return nil, f.err
-}
-
-// fakeRuntimeHelper implementes kubecontainer.RuntimeHelper inter
-// faces for testing purposes.
-type fakeRuntimeHelper struct{}
-
-var _ kubecontainer.RuntimeHelper = &fakeRuntimeHelper{}
-
-var testPodContainerDir string
-
-func (f *fakeRuntimeHelper) GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string) (*kubecontainer.RunContainerOptions, error) {
-	var opts kubecontainer.RunContainerOptions
-	var err error
-	if len(container.TerminationMessagePath) != 0 {
-		testPodContainerDir, err = ioutil.TempDir(testTempDir, "fooPodContainerDir")
-		if err != nil {
-			return nil, err
-		}
-		opts.PodContainerDir = testPodContainerDir
-	}
-	return &opts, nil
-}
-
-func (f *fakeRuntimeHelper) GetClusterDNS(pod *v1.Pod) ([]string, []string, error) {
-	return nil, nil, fmt.Errorf("not implemented")
-}
-
-// This is not used by docker runtime.
-func (f *fakeRuntimeHelper) GeneratePodHostNameAndDomain(pod *v1.Pod) (string, string, error) {
-	return "", "", nil
-}
-
-func (f *fakeRuntimeHelper) GetPodDir(kubetypes.UID) string {
-	return ""
-}
-
-func (f *fakeRuntimeHelper) GetExtraSupplementalGroupsForPod(pod *v1.Pod) []int64 {
-	return nil
 }
 
 type fakeImageManager struct{}
@@ -160,7 +122,7 @@ func createTestDockerManager(fakeHTTPClient *fakeHTTP, fakeDocker *FakeDockerCli
 		0, 0, "",
 		&containertest.FakeOS{},
 		networkPlugin,
-		&fakeRuntimeHelper{},
+		&containertest.FakeRuntimeHelper{},
 		fakeHTTPClient,
 		flowcontrol.NewBackOff(time.Second, 300*time.Second))
 
@@ -327,10 +289,10 @@ func TestSetEntrypointAndCommand(t *testing.T) {
 		}
 		setEntrypointAndCommand(tc.container, opts, actualOpts)
 
-		if e, a := tc.expected.Config.Entrypoint, actualOpts.Config.Entrypoint; !api.Semantic.DeepEqual(e, a) {
+		if e, a := tc.expected.Config.Entrypoint, actualOpts.Config.Entrypoint; !apiequality.Semantic.DeepEqual(e, a) {
 			t.Errorf("%v: unexpected entrypoint: expected %v, got %v", tc.name, e, a)
 		}
-		if e, a := tc.expected.Config.Cmd, actualOpts.Config.Cmd; !api.Semantic.DeepEqual(e, a) {
+		if e, a := tc.expected.Config.Cmd, actualOpts.Config.Cmd; !apiequality.Semantic.DeepEqual(e, a) {
 			t.Errorf("%v: unexpected command: expected %v, got %v", tc.name, e, a)
 		}
 	}
@@ -1269,6 +1231,9 @@ func TestPortForwardNoSuchContainer(t *testing.T) {
 
 func TestSyncPodWithTerminationLog(t *testing.T) {
 	dm, fakeDocker := newTestDockerManager()
+	// Set test pod container directory.
+	testPodContainerDir := "test/pod/container/dir"
+	dm.runtimeHelper.(*containertest.FakeRuntimeHelper).PodContainerDir = testPodContainerDir
 	container := v1.Container{
 		Name: "bar",
 		TerminationMessagePath: "/dev/somepath",
@@ -1286,8 +1251,6 @@ func TestSyncPodWithTerminationLog(t *testing.T) {
 		// Create container.
 		"create", "start", "inspect_container",
 	})
-
-	defer os.Remove(testPodContainerDir)
 
 	fakeDocker.Lock()
 	if len(fakeDocker.Created) != 2 ||
@@ -1644,27 +1607,29 @@ func verifySyncResults(t *testing.T, expectedResults []*kubecontainer.SyncResult
 		}
 	}
 }
-
-func TestSecurityOptsOperator(t *testing.T) {
+func TestGetDockerOptSeparator(t *testing.T) {
 	dm110, _ := newTestDockerManagerWithVersion("1.10.1", "1.22")
 	dm111, _ := newTestDockerManagerWithVersion("1.11.0", "1.23")
 
-	secOpts := []dockerOpt{{"seccomp", "unconfined", ""}}
-	opts, err := dm110.fmtDockerOpts(secOpts)
-	if err != nil {
-		t.Fatalf("error getting security opts for Docker 1.10: %v", err)
-	}
-	if expected := []string{"seccomp:unconfined"}; len(opts) != 1 || opts[0] != expected[0] {
-		t.Fatalf("security opts for Docker 1.10: expected %v, got: %v", expected, opts)
-	}
+	sep, err := dm110.getDockerOptSeparator()
+	require.NoError(t, err, "error getting docker opt separator for 1.10.1")
+	assert.Equal(t, SecurityOptSeparatorOld, sep, "security opt separator for docker 1.10")
 
-	opts, err = dm111.fmtDockerOpts(secOpts)
-	if err != nil {
-		t.Fatalf("error getting security opts for Docker 1.11: %v", err)
-	}
-	if expected := []string{"seccomp=unconfined"}; len(opts) != 1 || opts[0] != expected[0] {
-		t.Fatalf("security opts for Docker 1.11: expected %v, got: %v", expected, opts)
-	}
+	sep, err = dm111.getDockerOptSeparator()
+	require.NoError(t, err, "error getting docker opt separator for 1.11.1")
+	assert.Equal(t, SecurityOptSeparatorNew, sep, "security opt separator for docker 1.11")
+}
+
+func TestFmtDockerOpts(t *testing.T) {
+	secOpts := []dockerOpt{{"seccomp", "unconfined", ""}}
+
+	opts := FmtDockerOpts(secOpts, ':')
+	assert.Len(t, opts, 1)
+	assert.Contains(t, opts, "seccomp:unconfined", "Docker 1.10")
+
+	opts = FmtDockerOpts(secOpts, '=')
+	assert.Len(t, opts, 1)
+	assert.Contains(t, opts, "seccomp=unconfined", "Docker 1.11")
 }
 
 func TestCheckVersionCompatibility(t *testing.T) {
@@ -1820,12 +1785,61 @@ func TestGetPodStatusNoSuchContainer(t *testing.T) {
 			Running:    false,
 		},
 	})
-	fakeDocker.InjectErrors(map[string]error{"inspect_container": containerNotFoundError{}})
+	fakeDocker.InjectErrors(map[string]error{"inspect_container": fmt.Errorf("Error: No such container: %s", noSuchContainerID)})
 	runSyncPod(t, dm, fakeDocker, pod, nil, false)
 
 	// Verify that we will try to start new contrainers even if the inspections
 	// failed.
 	verifyCalls(t, fakeDocker, []string{
+		// Inspect dead infra container for possible network teardown
+		"inspect_container",
+		// Start a new infra container.
+		"create", "start", "inspect_container", "inspect_container",
+		// Start a new container.
+		"create", "start", "inspect_container",
+	})
+}
+
+func TestSyncPodDeadInfraContainerTeardown(t *testing.T) {
+	const (
+		noSuchContainerID = "nosuchcontainer"
+		infraContainerID  = "9876"
+	)
+	dm, fakeDocker := newTestDockerManager()
+	dm.podInfraContainerImage = "pod_infra_image"
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	fnp := nettest.NewMockNetworkPlugin(ctrl)
+	dm.network = network.NewPluginManager(fnp)
+
+	pod := makePod("foo", &v1.PodSpec{
+		Containers: []v1.Container{{Name: noSuchContainerID}},
+	})
+
+	fakeDocker.SetFakeContainers([]*FakeContainer{
+		{
+			ID:         infraContainerID,
+			Name:       "/k8s_POD." + strconv.FormatUint(generatePodInfraContainerHash(pod), 16) + "_foo_new_12345678_42",
+			ExitCode:   0,
+			StartedAt:  time.Now(),
+			FinishedAt: time.Now(),
+			Running:    false,
+		},
+	})
+
+	// Can be called multiple times due to GetPodStatus
+	fnp.EXPECT().Name().Return("someNetworkPlugin").AnyTimes()
+	fnp.EXPECT().TearDownPod("new", "foo", gomock.Any()).Return(nil)
+	fnp.EXPECT().GetPodNetworkStatus("new", "foo", gomock.Any()).Return(&network.PodNetworkStatus{IP: net.ParseIP("1.1.1.1")}, nil).AnyTimes()
+	fnp.EXPECT().SetUpPod("new", "foo", gomock.Any()).Return(nil)
+
+	runSyncPod(t, dm, fakeDocker, pod, nil, false)
+
+	// Verify that we will try to start new contrainers even if the inspections
+	// failed.
+	verifyCalls(t, fakeDocker, []string{
+		// Inspect dead infra container for possible network teardown
+		"inspect_container",
 		// Start a new infra container.
 		"create", "start", "inspect_container", "inspect_container",
 		// Start a new container.
@@ -1875,8 +1889,8 @@ func TestSyncPodGetsPodIPFromNetworkPlugin(t *testing.T) {
 	dm.podInfraContainerImage = "pod_infra_image"
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	fnp := mock_network.NewMockNetworkPlugin(ctrl)
-	dm.networkPlugin = fnp
+	fnp := nettest.NewMockNetworkPlugin(ctrl)
+	dm.network = network.NewPluginManager(fnp)
 
 	pod := makePod("foo", &v1.PodSpec{
 		Containers: []v1.Container{
